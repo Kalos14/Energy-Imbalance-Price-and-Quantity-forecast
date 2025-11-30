@@ -151,14 +151,18 @@ def main():
         forecast_horizon=1
     )
     
-    X_train_flat, y_train = preprocessor.fit_transform(train_data)
-    X_train_flat, _ = preprocessor.create_features_flat(train_data)
+    # Fit preprocessor on training data
+    preprocessor.fit(train_data)
+    
+    # Get flat features for simple model
+    X_train_flat, y_train = preprocessor.create_features_flat(train_data)
     X_test_flat, y_test = preprocessor.create_features_flat(test_data)
     
     simple_model, simple_pred, simple_metrics, y_test_orig = train_simple_model(
         X_train_flat, y_train, X_test_flat, y_test, preprocessor
     )
     
+    # Get sequence features for complex model
     X_train_seq, y_train_seq = preprocessor.transform(train_data)
     X_test_seq, y_test_seq = preprocessor.transform(test_data)
     
