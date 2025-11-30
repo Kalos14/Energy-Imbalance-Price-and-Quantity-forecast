@@ -108,11 +108,19 @@ class ImbalancePriceARMA:
         
         # Fit ARMA model (ARIMA with d=0)
         # Using ARIMA with d=0 is equivalent to ARMA
-        self.model_ = ARIMA(
-            self._transformed_data, 
-            order=(self.p, 0, self.q)
-        )
-        self.results_ = self.model_.fit()
+        try:
+            self.model_ = ARIMA(
+                self._transformed_data, 
+                order=(self.p, 0, self.q)
+            )
+            self.results_ = self.model_.fit()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to fit ARMA({self.p},{self.q}) model. "
+                f"This may be due to convergence issues or invalid model orders. "
+                f"Consider trying different p, q values or checking data quality. "
+                f"Original error: {e}"
+            ) from e
         
         return self
     
@@ -156,7 +164,7 @@ class ImbalancePriceARMA:
         if return_conf_int:
             conf_int = forecast_obj.conf_int(alpha=alpha)
             # Handle both DataFrame and ndarray return types
-            if hasattr(conf_int, 'iloc'):
+            if isinstance(conf_int, pd.DataFrame):
                 lower = inverse_arcsinh_transform(conf_int.iloc[:, 0].values, self.std_)
                 upper = inverse_arcsinh_transform(conf_int.iloc[:, 1].values, self.std_)
             else:
