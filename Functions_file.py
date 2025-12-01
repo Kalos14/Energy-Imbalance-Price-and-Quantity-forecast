@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import time
-from sklearn.calibration import cross_val_predict
+from sklearn.model_selection import cross_val_predict
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, Lasso
 from xgboost import XGBRegressor, XGBClassifier
@@ -12,6 +12,8 @@ from sklearn.dummy import DummyClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 import joblib
+from sklearn.model_selection import  ParameterGrid
+from catboost import CatBoostRegressor, CatBoostClassifier
 
 
 
@@ -424,6 +426,7 @@ def train_regression_models(
             ])
             clf.fit(X_enriched, y_regime)
         else:
+            print(f"h={h}: Only one class in regime; using DummyClassifier.")
             clf = DummyClassifier(strategy="constant", constant=int(unique_classes[0]))
             clf.fit(X_enriched, y_regime)
 
@@ -454,7 +457,6 @@ import warnings
 def evaluate_models_from_features(
     df: pd.DataFrame, models: dict, horizons=None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    
     assert df["reference_date"].is_monotonic_increasing, "Data not chrono-sorted!"
 
     feature_cols = models["feature_cols"]
@@ -471,8 +473,11 @@ def evaluate_models_from_features(
         regime_targets = df["is_long"].shift(-h)
         current_price = df["price"]  # For residuals/reconstruct
 
-        valid_mask = (df[feature_cols].notna().all(1) &
-                      price_targets.notna() & regime_targets.notna())
+        valid_mask = (
+            df[feature_cols].notna().all(1)
+            & price_targets.notna()
+            & regime_targets.notna()
+        )
         tmp_idx = valid_mask[valid_mask].index  # Indices for targets
         if len(tmp_idx) < 100:
             warnings.warn(f"Low samples h={h}: {len(tmp_idx)}")
@@ -498,20 +503,41 @@ def evaluate_models_from_features(
         # Price metrics
         mae = mean_absolute_error(y_price, P_hat)
         rmse = np.sqrt(mean_squared_error(y_price, P_hat))
-        price_results.append({"horizon": h, "mae": mae, "rmse": rmse, "n_samples": len(tmp_idx)})
+        price_results.append(
+            {
+                "horizon": h,
+                "mae": mae,
+                "rmse": rmse,
+                "n_samples": len(tmp_idx),
+            }
+        )
 
-        # Prob metrics (unchanged)
+        # Prob metrics
         clf = models["prob_long"][h]
-        pi_hat = clf.predict_proba(X_enriched)[:, 1] if hasattr(clf, "predict_proba") else clf.predict(X_enriched).astype(float)
+        if hasattr(clf, "predict_proba"):
+            pi_hat = clf.predict_proba(X_enriched)[:, 1]
+        else:
+            pi_hat = clf.predict(X_enriched).astype(float)
+
         unique_classes = np.unique(y_regime)
         auc = roc_auc_score(y_regime, pi_hat) if len(unique_classes) > 1 else np.nan
         pi_hat_clipped = np.clip(pi_hat, 1e-6, 1 - 1e-6)
         ll = log_loss(y_regime, pi_hat_clipped)
         brier = brier_score_loss(y_regime, pi_hat_clipped)
-        prob_results.append({"horizon": h, "auc": auc, "log_loss": ll, "brier": brier, "n_samples": len(tmp_idx)})
+        prob_results.append(
+            {
+                "horizon": h,
+                "auc": auc,
+                "log_loss": ll,
+                "brier": brier,
+                "n_samples": len(tmp_idx),
+            }
+        )
 
-    return (pd.DataFrame(price_results).sort_values("horizon"),
-            pd.DataFrame(prob_results).sort_values("horizon"))
+    return (
+        pd.DataFrame(price_results).sort_values("horizon"),
+        pd.DataFrame(prob_results).sort_values("horizon"),
+    )
 
 
 def predict_24_steps_from_features(df_recent: pd.DataFrame, models: dict) -> pd.DataFrame:
@@ -594,6 +620,8 @@ def reliability_curve(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10, 
     df["ece"] = df["ece_contrib"].sum()
     return df
 
+import matplotlib.pyplot as plt
+
 def regression_results(price_metrics: pd.DataFrame, prob_metrics: pd.DataFrame,
                        forecasts: pd.DataFrame, save_dir: str | None = None) -> dict:
     """Tables/figs summary; saves PNGs."""
@@ -618,7 +646,6 @@ def regression_results(price_metrics: pd.DataFrame, prob_metrics: pd.DataFrame,
     forecasts["E_price_hat"] = forecasts["pi_long_hat"] * forecasts["P_long_hat"] + \
                                (1 - forecasts["pi_long_hat"]) * forecasts["P_short_hat"]
     
-    import matplotlib.pyplot as plt
     figs = {}
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
@@ -660,8 +687,8 @@ from joblib import Parallel, delayed
 import warnings
 
 def regression_cv(df: pd.DataFrame, alphas, r_type: str = "ridge",
-                  horizons=range(1, 13),  # Short: Fast/prod
-                  n_splits: int = 3, use_residuals: bool = True, n_jobs: int = -1) -> tuple[float, pd.DataFrame, pd.DataFrame]:
+                  horizons=range(1, 6),  # Short: Fast/prod
+                  n_splits: int = 3, use_residuals: bool = True, n_jobs: int = 1) -> tuple[float, pd.DataFrame, pd.DataFrame]:
 
     assert df["reference_date"].is_monotonic_increasing, "Data not chrono-sorted!"
 
@@ -695,15 +722,6 @@ def regression_cv(df: pd.DataFrame, alphas, r_type: str = "ridge",
     return best_alpha, cv_results, summary
 
 
-import pandas as pd
-import numpy as np
-import warnings
-import joblib
-from pathlib import Path
-from xgboost import XGBRegressor, XGBClassifier
-from sklearn.dummy import DummyClassifier # FIXED import
-from sklearn.model_selection import cross_val_predict, TimeSeriesSplit, ParameterGrid
-from joblib import Parallel, delayed
 
 def train_xgb_two_stage_residual_models(
     df: pd.DataFrame,
@@ -729,24 +747,23 @@ def train_xgb_two_stage_residual_models(
     }
     
     exclude_cols = {"flow_date", "mtu", "reference_date"}
-    feature_cols = [c for c in df.select_dtypes("number").columns if c not in exclude_cols]
-    
+    feature_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude_cols]    
     models = {
-        "feature_cols": feature_cols, "horizons": list(horizons),
-        "quantity": {}, "price_long": {}, "price_short": {}, "prob_long": {},
-        "model_type": "xgboost_two_stage", "uses_quantity_hat": True,
-        "uses_price_residual": use_residuals,
-        "xgb_reg_params": xgb_reg_params, "xgb_clf_params": xgb_clf_params
+    "feature_cols": feature_cols,
+    "horizons": list(horizons),
+    "quantity": {},
+    "price_long": {},
+    "price_short": {},
+    "prob_long": {},
+    "model_type": "xgboost_two_stage",
+    "uses_quantity_hat": True,
+    "uses_price_residual": use_residuals,
+    "xgb_reg_params": xgb_reg_params,
+    "xgb_clf_params": xgb_clf_params,
     }
     
-    # Dynamic keys based on residual usage
-    price_long_key = "price_long_resid" if use_residuals else "price_long"
-    price_short_key = "price_short_resid" if use_residuals else "price_short"
-    
-    # Prepare dictionaries in case they weren't init
-    if price_long_key not in models: models[price_long_key] = {}
-    if price_short_key not in models: models[price_short_key] = {}
-    
+    trained_horizons = []
+  
     for h in horizons:
         # 1. Prepare Targets
         price_targs = df["price"].shift(-h)
@@ -803,8 +820,8 @@ def train_xgb_two_stage_residual_models(
         short_m = XGBRegressor(**xgb_reg_params)
         short_m.fit(X_enrich[mask_s], y_price_tgt[mask_s])
         
-        models[price_long_key][h] = long_m
-        models[price_short_key][h] = short_m
+        models["price_long"][h] = long_m
+        models["price_short"][h] = short_m
         
         # --- STAGE 2: Probability Model ---
         uniq = np.unique(y_regime)
@@ -813,10 +830,16 @@ def train_xgb_two_stage_residual_models(
             clf.fit(X_enrich, y_regime)
         else:
             # Fallback if only one class exists in this window
+            print(f"h={h}: Only one class in regime; using DummyClassifier.")
             clf = DummyClassifier(strategy="constant", constant=int(uniq[0]))
             clf.fit(X_enrich, y_regime)
             
         models["prob_long"][h] = clf
+        trained_horizons.append(h)
+
+
+    models["horizons"] = trained_horizons
+
     
     if save_dir:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
@@ -844,8 +867,6 @@ def xgb_cv(
     
     param_list = list(ParameterGrid(param_grid))
     
-    # Need to import evaluate function inside or ensure it's in scope
-    # from model_utils import evaluate_models_from_features
     
     def cv_fold(params, fold_id, train_idx, val_idx):
         # Force n_jobs=1 inside fold to avoid exploding threads
@@ -861,8 +882,18 @@ def xgb_cv(
                 xgb_clf_params=clf_params
             )
             # Evaluate
-            price_m, _ = evaluate_models_from_features(df_features.iloc[val_idx], models, horizons)
+            trained_horizons = list(models["quantity"].keys())
             
+            if not trained_horizons:
+                warnings.warn(f"Fold {fold_id}: No models trained (likely insufficient data). Skipping.")
+                return None
+            
+            eval_horizons = [h for h in horizons if h in trained_horizons]
+            if not eval_horizons:
+                return None
+
+            price_m, _ = evaluate_models_from_features(df_features.iloc[val_idx], models, eval_horizons)
+            # ------------------------------------
             if price_m.empty: return None
             
             return {
@@ -898,3 +929,220 @@ def xgb_cv(
     best_params = summary.iloc[0]["params"]
     
     return best_params, cv_df, summary
+
+
+def generate_full_forecasts(df: pd.DataFrame, models: dict) -> pd.DataFrame:
+    """
+    Generates predictions for the entire dataset for all horizons.
+    Handles both Numpy-based models (XGB/Linear) and DataFrame-based models (CatBoost).
+    """
+    all_preds = []
+    feature_cols = models["feature_cols"]
+    horizons = models["horizons"]
+    use_residuals = models.get("uses_price_residual", False)
+
+    print(f"Generating forecasts for {len(df)} rows across {len(horizons)} horizons...")
+
+    for h in horizons:
+        # Check valid rows
+        valid_mask = df[feature_cols].notna().all(axis=1)
+        if not valid_mask.any(): continue
+        
+        idx = df.index[valid_mask]
+        
+        # --- MODEL CHECK ---
+        # Look at the quantity model for this horizon to decide input type
+        model_qty = models["quantity"].get(h)
+        if model_qty is None: continue # Skip if model missing for this h
+        
+        is_catboost = "catboost" in str(type(model_qty)).lower()
+        
+        if is_catboost:
+            X_base = df.loc[idx, feature_cols]
+        else:
+            X_base = df.loc[idx, feature_cols].to_numpy()
+        # -------------------
+        
+        # 1. Quantity Hat
+        if models["uses_quantity_hat"]:
+            q_hat = model_qty.predict(X_base).reshape(-1, 1)
+            
+            if is_catboost:
+                X_enrich = X_base.copy()
+                X_enrich["quantity_hat"] = q_hat
+            else:
+                X_enrich = np.hstack([X_base, q_hat])
+        else:
+            X_enrich = X_base
+            
+        # 2. Predict Prices
+        p_long_key = "price_long_resid" if use_residuals else "price_long"
+        p_short_key = "price_short_resid" if use_residuals else "price_short"
+        
+        pred_l = models[p_long_key][h].predict(X_enrich)
+        pred_s = models[p_short_key][h].predict(X_enrich)
+        
+        if use_residuals:
+            curr_price = df.loc[idx, "price"].to_numpy()
+            pred_l += curr_price
+            pred_s += curr_price
+            
+        # 3. Predict Prob
+        prob_model = models["prob_long"][h]
+        if hasattr(prob_model, "predict_proba"):
+            prob_l = prob_model.predict_proba(X_enrich)[:, 1]
+        else:
+            prob_l = prob_model.predict(X_enrich).astype(float)
+            
+        # 4. Store
+        chunk = pd.DataFrame({
+            "reference_date": df.loc[idx, "reference_date"],
+            "mtu_start": df.loc[idx, "mtu"],
+            "horizon": h,
+            "pred_price_long": pred_l.flatten(),
+            "pred_price_short": pred_s.flatten(),
+            "pred_prob_long": prob_l.flatten()
+        })
+        all_preds.append(chunk)
+        
+    if not all_preds:
+        return pd.DataFrame()
+        
+    return pd.concat(all_preds, ignore_index=True)
+
+
+def train_catboost_two_stage_residual_models(
+    df: pd.DataFrame,
+    horizons=range(1, 25),
+    save_dir: str | None = None,
+    cat_params: dict | None = None,
+    use_residuals: bool = True,
+) -> dict:
+    
+    assert pd.api.types.is_datetime64_any_dtype(df["reference_date"]), "Use datetime."
+    assert df["reference_date"].is_monotonic_increasing, "Sort upstream!"
+    
+    exclude_cols = {"flow_date", "mtu", "reference_date"}
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
+    
+    cat_features_names = [
+        c for c in feature_cols
+        if df[c].dtype == "object" or df[c].dtype.name == "category"
+    ]
+    
+    print(f"CatBoost Feature Set: {len(feature_cols)} features.")
+    if cat_features_names:
+        print(f" -> Categorical Features enabled: {cat_features_names}")
+
+    # Default Params
+    base_params = cat_params or {
+        "iterations": 300,
+        "depth": 4,
+        "learning_rate": 0.1,
+        "loss_function": "RMSE",
+        "verbose": 0,
+        "allow_writing_files": False,
+        "thread_count": -1,
+    }
+    
+    models = {
+        "feature_cols": feature_cols,
+        "horizons": list(horizons),  
+        "cat_features": cat_features_names,
+        "quantity": {},
+        "price_long": {},
+        "price_short": {},
+        "prob_long": {},
+        "model_type": "catboost_two_stage",
+        "uses_quantity_hat": True,
+        "uses_price_residual": use_residuals,
+    }
+    
+    trained_horizons = []
+
+    for h in horizons:
+        # Targets
+        price_targs = df["price"].shift(-h)
+        qty_targs = df["quantity"].shift(-h)
+        regime_targs = df["is_long"].shift(-h)
+        price_curr = df["price"]
+        
+        valid_mask = (
+            df[feature_cols].notna().all(axis=1)
+            & price_targs.notna()
+            & regime_targs.notna()
+        )
+        
+        if not valid_mask.any():
+            print(f"CatBoost WARNING: h={h} skipped (No valid data).")
+            continue
+        
+        idx = df.index[valid_mask]
+        
+        X_base = df.loc[idx, feature_cols]
+        y_qty = qty_targs.loc[idx].values
+        y_price = price_targs.loc[idx].values
+        y_regime = regime_targs.loc[idx].values.astype(int)
+        price_c = price_curr.loc[idx].values
+        
+        # Target price: residuo o livello
+        y_price_tgt = (y_price - price_c) if use_residuals else y_price
+        
+        # --- STAGE 1: Quantity ---
+        qty_m = CatBoostRegressor(**base_params, cat_features=cat_features_names)
+        qty_m.fit(X_base, y_qty)
+        models["quantity"][h] = qty_m
+        
+        q_hat_train = qty_m.predict(X_base)  
+        
+        # Enrich features con quantity_hat
+        X_enrich = X_base.copy()
+        X_enrich["quantity_hat"] = q_hat_train
+        
+        # --- STAGE 2: Price (Long/Short) ---
+        mask_l = y_regime == 1
+        mask_s = y_regime == 0
+        
+        if not (mask_l.any() and mask_s.any()):
+            print(
+                f"CatBoost WARNING: h={h} skipped (Long={mask_l.sum()}, Short={mask_s.sum()})."
+            )
+            continue
+        
+        # Long-regime model
+        long_m = CatBoostRegressor(**base_params, cat_features=cat_features_names)
+        long_m.fit(X_enrich.loc[mask_l], y_price_tgt[mask_l])
+        models["price_long"][h] = long_m
+        
+        # Short-regime model
+        short_m = CatBoostRegressor(**base_params, cat_features=cat_features_names)
+        short_m.fit(X_enrich.loc[mask_s], y_price_tgt[mask_s])
+        models["price_short"][h] = short_m
+        
+        # --- STAGE 2: Probability regime (classifier) ---
+        clf_params = base_params.copy()
+        clf_params.pop("loss_function", None)  
+        
+        if len(np.unique(y_regime)) > 1:
+            clf = CatBoostClassifier(
+                **clf_params,
+                loss_function="Logloss",
+                cat_features=cat_features_names,
+            )
+            clf.fit(X_enrich, y_regime)
+        else:
+            print(f"h={h}: Only one class in regime; using DummyClassifier.")
+            clf = DummyClassifier(strategy="constant", constant=int(y_regime[0]))
+            clf.fit(X_enrich, y_regime)
+            
+        models["prob_long"][h] = clf
+        
+        trained_horizons.append(h)
+    
+    models["horizons"] = trained_horizons
+    
+    if save_dir:
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        joblib.dump(models, Path(save_dir) / "models_catboost.joblib")
+        
+    return models
